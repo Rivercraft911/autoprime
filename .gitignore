@@ -1,0 +1,26 @@
+# Agent prompt files (generated per-session by launchers)
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.cursorrules
+.aider*
+.claude/
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+
+# Local virtual environments
+.venv/
+
+# Autoprime experiment outputs
+results.tsv
+run.log
+*.log
+solve/run
+solve/.run.*.out
+solve/*.o
+solve/*.dSYM/
+solve/*.metallib
+solve/*.air
+
