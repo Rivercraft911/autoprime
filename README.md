@@ -2,9 +2,9 @@
 
 > **Work in progress.**
 
-A riff on [karpathy/autoresearch](https://github.com/karpathy/autoresearch). autoresearch turns an AI agent loose overnight to improve a tiny training run; autoprime points the same loop at **prime numbers** — and dreams of climbing, run after run, toward record territory.
+A riff on [karpathy/autoresearch](https://github.com/karpathy/autoresearch). autoresearch turns an AI agent loose overnight to improve a tiny training run; autoprime points the same loop at **prime numbers**, and dreams of climbing, run after run, toward record territory.
 
-The agent owns a solver workspace; a fixed judge verifies every claim. The fun is range: invent an algorithm, optimize a classic sieve, use every core, reach for libgmp or the GPU, or just guess enormous candidates and check them. The judge doesn't care *how* — only that the primes are real, non-Mersenne, and found in time.
+The agent owns a solver workspace; a fixed judge verifies every claim. The fun is range: invent an algorithm, optimize a classic sieve, use every core, reach for libgmp or the GPU, or just guess enormous candidates and check them. The judge doesn't care *how*, only that the primes are real, non-Mersenne, and found in time.
 
 ## Run
 
