@@ -11,8 +11,11 @@ What it does, every run:
   2. BUILD the workspace by running `solve/build.sh` (untimed)
   3. RUN the produced `solve/run` for a fixed time budget (timed, hard-killed)
   4. VERIFY every claimed prime independently with sympy, rejecting Mersenne
-     numbers and anything that isn't actually prime
-  5. SCORE and print a grep-able summary block
+     numbers and anything that isn't actually prime. This is untimed and
+     rigorous (deterministic for all n < 2**64) — it takes as long as it needs
+     to be certain, and is streamed so even a multi-GB run stays in bounds.
+  5. SCORE and print a grep-able summary block. `count` is uncapped: the score
+     is simply how many distinct primes were verified, so it can climb forever.
 
 The judge is deliberately strategy-agnostic. It does not care HOW a number was
 produced — pure C, a Metal GPU kernel, an ML predictor's guess, whatever. It
@@ -43,8 +46,14 @@ import sympy
 # --- fixed constants (do not depend on the agent) ---------------------------
 TIME_BUDGET = 60          # wall-clock run budget in seconds
 GRACE_SECONDS = 5         # extra slack before the harness hard-kills the run
-MAX_CLAIMS = 5_000_000    # guard against pathological output volume
 POLL_INTERVAL = 0.05      # how often we check the run's deadline
+
+# Memory-safety valve only — NOT a scoring ceiling. The judge must remember
+# every DISTINCT claim to reject duplicates, so an unbounded solver could
+# otherwise exhaust RAM. This guard sits far above any presently reachable
+# count; the `count` score is open-ended below it. Raise it if your hardware
+# allows. (This replaces the old hard 5M cap: `count` is now a forever climb.)
+CLAIM_SAFETY_LIMIT = 200_000_000
 
 PRIME_RE = re.compile(rb"^\s*PRIME\s+([0-9]+)\s*$")
 
@@ -148,10 +157,9 @@ def run_solver(run_path, workspace, task, time_budget):
                 killed = True
                 break
             time.sleep(POLL_INTERVAL)
-        # Read from the same handle the child wrote to — no reopen-by-path race.
         out.flush()
-        out.seek(0)
-        data = out.read(cutoff_size)
+    if cutoff_size is None:                       # never hit the deadline path
+        cutoff_size = os.path.getsize(out_path)
     elapsed = time.monotonic() - start
     if killed:
         print(
@@ -159,33 +167,10 @@ def run_solver(run_path, workspace, task, time_budget):
             file=sys.stderr,
             flush=True,
         )
-    try:
-        os.remove(out_path)
-    except OSError:
-        pass
-    return data, elapsed
-
-
-def parse_claims(data):
-    """Pull distinct candidate integers out of complete `PRIME <n>` lines."""
-    if data and not data.endswith(b"\n"):
-        last_newline = data.rfind(b"\n")
-        data = data[:last_newline + 1] if last_newline >= 0 else b""
-
-    seen = set()
-    claims = []
-    for line in data.splitlines():
-        m = PRIME_RE.match(line)
-        if not m:
-            continue  # ignore noise and truncated trailing lines
-        n = int(m.group(1))
-        if n in seen:
-            continue
-        seen.add(n)
-        claims.append(n)
-        if len(claims) >= MAX_CLAIMS:
-            break
-    return claims
+    # Hand back the capture file and the official byte cutoff. Scoring streams it
+    # line by line so even a multi-GB run never has to live in memory at once.
+    # The caller deletes the file once it has finished scoring.
+    return out_path, cutoff_size, elapsed
 
 
 def is_mersenne(n):
@@ -194,13 +179,54 @@ def is_mersenne(n):
     return m > 1 and (m & (m - 1)) == 0
 
 
-def verify(claims):
-    """Keep only genuine, non-Mersenne primes. This is the ground truth."""
-    verified = []
-    for n in claims:
-        if n > 1 and not is_mersenne(n) and sympy.isprime(n):
-            verified.append(n)
-    return verified
+def is_genuine_prime(n):
+    """Ground truth for one claim: a real, non-Mersenne prime.
+
+    sympy.isprime is deterministic for every n < 2**64 (BPSW), which covers any
+    prime a `count` solver can realistically enumerate — so a verified claim is
+    certain, not merely probable. This check is deliberately untimed: the judge
+    takes as long as it needs to be sure and never trades rigor for speed.
+    """
+    return n > 1 and not is_mersenne(n) and sympy.isprime(n)
+
+
+def score_run(out_path, cutoff_size):
+    """Stream the capture file up to the deadline cutoff and score it.
+
+    One pass: dedup distinct `PRIME <n>` claims, verify each rigorously, reject
+    Mersenne, and track how many verified and the maximum. Reading line by line
+    (rather than slurping the whole file) keeps the judge's footprint bounded by
+    the set of distinct claims, so `count` has no artificial ceiling — only
+    CLAIM_SAFETY_LIMIT, a far-off memory guard, caps what we will remember.
+
+    Only bytes present at the official deadline count: we stop at cutoff_size and
+    ignore any final partial (non-newline-terminated) line.
+    """
+    seen = set()
+    num_verified = 0
+    best = None
+    remaining = cutoff_size
+    with open(out_path, "rb") as f:
+        for line in f:
+            if len(line) > remaining:
+                break  # line straddles the deadline cutoff — drop the partial tail
+            remaining -= len(line)
+            if not line.endswith(b"\n"):
+                break  # unterminated final line — ignore it
+            m = PRIME_RE.match(line)
+            if not m:
+                continue  # noise and truncated lines are ignored
+            n = int(m.group(1))
+            if n in seen:
+                continue
+            seen.add(n)
+            if is_genuine_prime(n):
+                num_verified += 1
+                if best is None or n > best:
+                    best = n
+            if len(seen) >= CLAIM_SAFETY_LIMIT:
+                break
+    return len(seen), num_verified, best
 
 
 def _fmt_prime(n):
@@ -229,26 +255,30 @@ def main():
     run_path = build(args.workspace, specs, args.task, args.time)
 
     # Run (timed).
-    data, solve_seconds = run_solver(run_path, args.workspace, args.task, args.time)
+    out_path, cutoff_size, solve_seconds = run_solver(
+        run_path, args.workspace, args.task, args.time)
 
-    # Verify (untimed but reported).
-    claims = parse_claims(data)
+    # Verify + score (untimed but reported). Streamed so a huge run never lives
+    # in memory at once; every claim is checked, taking as long as it needs to.
     t0 = time.monotonic()
-    verified = verify(claims)
+    num_claimed, num_verified, best = score_run(out_path, cutoff_size)
     verify_seconds = time.monotonic() - t0
+    try:
+        os.remove(out_path)
+    except OSError:
+        pass
 
-    best = max(verified) if verified else None
     if args.task == "largest":
         score = len(str(best)) if best is not None else 0
-    else:  # count
-        score = len(verified)
+    else:  # count — distinct verified non-Mersenne primes, uncapped
+        score = num_verified
 
     print("---")
     print(f"task:            {args.task}")
     print(f"score:           {score}")
     print(f"best_prime:      {_fmt_prime(best) if best is not None else 'none'}")
-    print(f"num_verified:    {len(verified)}")
-    print(f"num_claimed:     {len(claims)}")
+    print(f"num_verified:    {num_verified}")
+    print(f"num_claimed:     {num_claimed}")
     print(f"solve_seconds:   {solve_seconds:.1f}")
     print(f"verify_seconds:  {verify_seconds:.1f}")
     print(f"cores:           {specs['cores']}")

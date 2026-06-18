@@ -64,10 +64,14 @@ The goal is simple: maximize `score` for the chosen task.
 
 - `largest`: score is the decimal digit count of the largest verified
   non-Mersenne prime.
-- `count`: score is the number of distinct verified non-Mersenne primes.
+- `count`: score is the number of distinct verified non-Mersenne primes. It is
+  **uncapped** — an exhaustive-enumeration climb with no ceiling, so the winning
+  move is to deterministically find *every* prime up to the highest bound you
+  can reach (no probabilistic luck). Climb it forever.
 
 The time budget is fixed, so runs are comparable. Build time and verification
-time are reported but do not count against the solver's budget.
+time are reported but do not count against the solver's budget — verification is
+rigorous and takes as long as it needs to be certain every counted prime is real.
 
 ## Creativity Charter
 
