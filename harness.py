@@ -43,6 +43,12 @@ import time
 
 import sympy
 
+# Python 3.11+ defaults to rejecting decimal-to-int conversions above a few
+# thousand digits. Autoprime's largest task intentionally goes far beyond that;
+# let SymPy, not the parser guardrail, decide how large a verified prime can be.
+if hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits(0)
+
 # --- fixed constants (do not depend on the agent) ---------------------------
 TIME_BUDGET = 60          # wall-clock run budget in seconds
 GRACE_SECONDS = 5         # extra slack before the harness hard-kills the run
