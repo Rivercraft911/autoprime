@@ -75,6 +75,11 @@ rigorous and takes as long as it needs to be certain every counted prime is real
 
 ## Creativity Charter
 
+**Be creative.** This is a race, and in this race creativity and a willingness
+to try new things are what lead to victory. Reach for the idea nobody else would
+reach for; the boldest, most original swing is usually the one that wins. Don't
+play it safe — try something new.
+
 Autoresearch prizes simple training-code hill climbing. Autoprime prizes range.
 Across iterations, swing between lanes:
 

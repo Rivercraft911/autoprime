@@ -10,10 +10,13 @@ What it does, every run:
   1. detect the machine (arch, chip, cores, gmp prefix) and expose it via env
   2. BUILD the workspace by running `solve/build.sh` (untimed)
   3. RUN the produced `solve/run` for a fixed time budget (timed, hard-killed)
-  4. VERIFY every claimed prime independently with sympy, rejecting Mersenne
-     numbers and anything that isn't actually prime. This is untimed and
-     rigorous (deterministic for all n < 2**64) — it takes as long as it needs
-     to be certain, and is streamed so even a multi-GB run stays in bounds.
+  4. VERIFY every claimed prime independently, rejecting Mersenne numbers and
+     anything that isn't actually prime. This is untimed and rigorous: the test
+     is BPSW (deterministic for all n < 2**64), run in C via gmpy2 and fanned
+     out across cores so hundreds of millions of claims verify in well under a
+     minute instead of ~12. Huge `largest` claims (n >= 2**64) keep the exact
+     sympy path. The capture file is read in blocks, never slurped whole, so a
+     multi-GB run stays in bounds. Speed here never comes at correctness's cost.
   5. SCORE and print a grep-able summary block. `count` is uncapped: the score
      is simply how many distinct primes were verified, so it can climb forever.
 
@@ -41,7 +44,19 @@ import sys
 import tempfile
 import time
 
+import multiprocessing as mp
+
+import numpy as np
 import sympy
+
+# gmpy2's primality test is the same BPSW used by sympy (deterministic for every
+# n < 2**64), but runs in C — far faster across the hundreds of millions of
+# small claims a `count` run produces. Optional: fall back to sympy if absent.
+try:
+    import gmpy2
+    _HAVE_GMPY2 = True
+except ImportError:                                  # pragma: no cover
+    _HAVE_GMPY2 = False
 
 # Python 3.11+ defaults to rejecting decimal-to-int conversions above a few
 # thousand digits. Autoprime's largest task intentionally goes far beyond that;
@@ -62,6 +77,12 @@ POLL_INTERVAL = 0.05      # how often we check the run's deadline
 CLAIM_SAFETY_LIMIT = 200_000_000
 
 PRIME_RE = re.compile(rb"^\s*PRIME\s+([0-9]+)\s*$")
+# Multiline variant for block-scanning the capture file in one C-level pass.
+_CLAIM_RE = re.compile(rb"(?m)^[ \t]*PRIME[ \t]+([0-9]+)[ \t]*\r?$")
+# Claims with at most this many digits fit in a signed 64-bit int (< 10**18 <
+# 2**63), so they ride the vectorized numpy/gmpy2 fast path. Longer claims (the
+# `largest` task's thousand-digit primes) take the exact big-integer path.
+_INT64_DIGITS = 18
 
 
 def _sysctl(key):
@@ -188,51 +209,144 @@ def is_mersenne(n):
 def is_genuine_prime(n):
     """Ground truth for one claim: a real, non-Mersenne prime.
 
-    sympy.isprime is deterministic for every n < 2**64 (BPSW), which covers any
-    prime a `count` solver can realistically enumerate — so a verified claim is
-    certain, not merely probable. This check is deliberately untimed: the judge
-    takes as long as it needs to be sure and never trades rigor for speed.
+    Both backends are BPSW, which is deterministic (no composite passes) for
+    every n < 2**64 — covering any prime a `count` solver can enumerate, so a
+    verified claim is certain, not merely probable. gmpy2 runs that same test in
+    C; for n >= 2**64 (the `largest` task's huge primes) we defer to sympy, the
+    original verifier, so nothing about that path's rigor changes. Still untimed:
+    the judge takes as long as it needs and never trades correctness for speed.
     """
-    return n > 1 and not is_mersenne(n) and sympy.isprime(n)
+    if n <= 1 or is_mersenne(n):
+        return False
+    if _HAVE_GMPY2 and n < (1 << 64):
+        return gmpy2.is_prime(int(n)) != 0
+    return bool(sympy.isprime(n))
+
+
+def _verify_small_chunk(arr):
+    """Worker: count genuine primes in a non-Mersenne int64 array.
+
+    Inputs are already filtered to n > 1 and non-Mersenne, and are < 2**64, so a
+    plain BPSW test settles each one deterministically. Returns (count, max) so
+    the parent can total the verified count and recover the largest prime.
+    """
+    primality = gmpy2.is_prime if _HAVE_GMPY2 else sympy.isprime
+    cnt = 0
+    best = 0
+    for x in arr.tolist():                 # python ints iterate faster than np scalars
+        if primality(x):
+            cnt += 1
+            if x > best:
+                best = x
+    return cnt, best
+
+
+def _verify_small(cand, workers):
+    """Verify a Mersenne-filtered int64 array of candidates, fanning out on cores.
+
+    Primality is embarrassingly parallel and dominates a big `count` verify, so
+    we split the candidates across a process pool. Small inputs (and the
+    `largest` task, which has almost none here) skip the pool entirely.
+    """
+    n = int(cand.size)
+    if n == 0:
+        return 0, None
+    if n < 1_000_000 or workers <= 1:
+        cnt, best = _verify_small_chunk(cand)
+        return cnt, (best or None)
+    total = 0
+    best = 0
+    chunks = np.array_split(cand, workers * 4)
+    with mp.Pool(workers) as pool:
+        for cnt, b in pool.imap_unordered(_verify_small_chunk, chunks):
+            total += cnt
+            if b > best:
+                best = b
+    return total, (best or None)
+
+
+def _read_claims(out_path, cutoff_size):
+    """Stream the capture file up to the deadline cutoff and extract every claim.
+
+    Reads in large blocks and pulls all `PRIME <n>` matches per block with one
+    C-level regex pass — no Python-level loop over hundreds of millions of lines.
+    Only bytes before cutoff_size count; a line straddling the cutoff (or an
+    unterminated final line) is left in the carry buffer and dropped, exactly as
+    the streaming scorer required. Claims that fit in int64 are returned as an
+    ndarray for vectorized handling; longer ones (huge `largest` primes) come
+    back as a separate list of Python ints.
+    """
+    small_chunks = []
+    big = []
+    remaining = cutoff_size
+    carry = b""
+    BLOCK = 1 << 26                                   # 64 MiB
+    with open(out_path, "rb") as f:
+        while remaining > 0:
+            block = f.read(BLOCK if BLOCK < remaining else remaining)
+            if not block:
+                break
+            remaining -= len(block)
+            data = carry + block
+            nl = data.rfind(b"\n")                    # process only complete lines
+            if nl < 0:
+                carry = data
+                continue
+            body, carry = data[:nl + 1], data[nl + 1:]
+            nums = _CLAIM_RE.findall(body)
+            if not nums:
+                continue
+            small = [x for x in nums if len(x) <= _INT64_DIGITS]
+            if small:
+                small_chunks.append(np.array(small, dtype=np.int64))
+            if len(small) != len(nums):
+                big.extend(int(x) for x in nums if len(x) > _INT64_DIGITS)
+    small = (np.concatenate(small_chunks) if small_chunks
+             else np.empty(0, dtype=np.int64))
+    return small, big
 
 
 def score_run(out_path, cutoff_size):
-    """Stream the capture file up to the deadline cutoff and score it.
+    """Read the capture file up to the deadline cutoff and score it.
 
-    One pass: dedup distinct `PRIME <n>` claims, verify each rigorously, reject
-    Mersenne, and track how many verified and the maximum. Reading line by line
-    (rather than slurping the whole file) keeps the judge's footprint bounded by
-    the set of distinct claims, so `count` has no artificial ceiling — only
-    CLAIM_SAFETY_LIMIT, a far-off memory guard, caps what we will remember.
-
-    Only bytes present at the official deadline count: we stop at cutoff_size and
-    ignore any final partial (non-newline-terminated) line.
+    Dedup distinct `PRIME <n>` claims, reject Mersenne, verify the rest, and
+    track how many verified and the maximum. The common case — a `count` run of
+    hundreds of millions of small primes — is handled with numpy (block parse,
+    sort-dedup, vectorized Mersenne reject) and a parallel BPSW sweep, turning a
+    ~12-minute verify into well under a minute without weakening any check. Huge
+    `largest` claims keep the exact per-number path. CLAIM_SAFETY_LIMIT still
+    caps how many distinct claims we score, a far-off memory guard.
     """
-    seen = set()
-    num_verified = 0
-    best = None
-    remaining = cutoff_size
-    with open(out_path, "rb") as f:
-        for line in f:
-            if len(line) > remaining:
-                break  # line straddles the deadline cutoff — drop the partial tail
-            remaining -= len(line)
-            if not line.endswith(b"\n"):
-                break  # unterminated final line — ignore it
-            m = PRIME_RE.match(line)
-            if not m:
-                continue  # noise and truncated lines are ignored
-            n = int(m.group(1))
-            if n in seen:
-                continue
-            seen.add(n)
-            if is_genuine_prime(n):
-                num_verified += 1
-                if best is None or n > best:
-                    best = n
-            if len(seen) >= CLAIM_SAFETY_LIMIT:
-                break
-    return len(seen), num_verified, best
+    small, big = _read_claims(out_path, cutoff_size)
+
+    small_distinct = np.unique(small) if small.size else small   # sorted + deduped
+    big_distinct = list(dict.fromkeys(big))                      # order-preserving
+
+    # Memory guard: score at most CLAIM_SAFETY_LIMIT distinct claims (small first).
+    if small_distinct.size >= CLAIM_SAFETY_LIMIT:
+        small_distinct = small_distinct[:CLAIM_SAFETY_LIMIT]
+        big_distinct = []
+    else:
+        big_distinct = big_distinct[:CLAIM_SAFETY_LIMIT - int(small_distinct.size)]
+    num_claimed = int(small_distinct.size) + len(big_distinct)
+
+    # Small claims: drop n <= 1 and Mersenne (n+1 a power of two) vectorized, then
+    # verify what's left in parallel.
+    if small_distinct.size:
+        d = small_distinct
+        cand = d[(d > 1) & (((d + 1) & d) != 0)]
+    else:
+        cand = small_distinct
+    workers = os.cpu_count() or 1
+    num_verified, best = _verify_small(cand, workers)
+
+    # Huge claims (e.g. the `largest` task): exact, untimed, one at a time.
+    for n in big_distinct:
+        if is_genuine_prime(n):
+            num_verified += 1
+            if best is None or n > best:
+                best = n
+    return num_claimed, num_verified, best
 
 
 def _fmt_prime(n):
