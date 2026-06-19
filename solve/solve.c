@@ -8,8 +8,8 @@
 #include <gmp.h>
 
 #define MAX_THREADS 64
-#define TARGET_DIGITS 5000
-#define DIGIT_STRIDE 53
+#define TARGET_DIGITS 7000
+#define DIGIT_STRIDE 43
 
 typedef struct {
     int id;
