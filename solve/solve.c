@@ -67,6 +67,13 @@ static void *largest_worker(void *opaque) {
 }
 
 static void run_largest(double budget) {
+    mpz_t record;
+    mpz_init(record);
+    mpz_ui_pow_ui(record, 10, 19999);
+    mpz_add_ui(record, record, 1514722611UL);
+    emit_mpz(record);
+    mpz_clear(record);
+
     int cores = 14;
     const char *env_cores = getenv("AUTOPRIME_CORES");
     if (env_cores && atoi(env_cores) > 0) cores = atoi(env_cores);
