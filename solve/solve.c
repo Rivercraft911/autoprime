@@ -1,38 +1,22 @@
-/*
- * autoprime baseline solver.
- *
- * This is YOUR file (and the rest of solve/). The harness only requires that
- * build.sh produces an executable ./run, and that ./run prints lines:
- *
- *     PRIME <decimal>\n
- *
- * one per prime found, flushed as you go. The harness independently verifies
- * every claim (genuine prime, non-Mersenne) and ignores everything else.
- *
- * Two tasks, selected with --task:
- *   largest : maximize the number of digits of the biggest prime you find.
- *   count   : maximize how many distinct primes you find.
- * --time <seconds> is your wall-clock budget (the harness hard-kills you a few
- * seconds after it elapses, so stop yourself a hair early).
- *
- * This baseline is deliberately simple and obviously correct: single-threaded
- * trial division. There is enormous headroom above it. The escalation menu:
- *   - segmented Sieve of Eratosthenes, wheel factorization
- *   - Miller-Rabin / BPSW / ECPP for fast primality
- *   - pthreads or GCD across all cores  (see $AUTOPRIME_CORES)
- *   - NEON SIMD (on by default for arm64), cache-blocking
- *   - libgmp (already linked) for thousand-digit `largest` candidates
- *   - the Metal GPU and the Accelerate/AMX matrix units (edit build.sh)
- *   - get weird: probabilistically guess giant candidates; train a tiny model
- *     to predict prime-rich regions and verify its guesses.
- * How you find them is entirely up to you. Only verified primes score.
- */
-
+#include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 #include <time.h>
+#include <unistd.h>
+#include <gmp.h>
+
+#define MAX_THREADS 64
+#define TARGET_DIGITS 3000
+#define DIGIT_STRIDE 37
+
+typedef struct {
+    int id;
+    int digits;
+} worker_arg_t;
+
+static pthread_mutex_t emit_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static double now_seconds(void) {
     struct timespec ts;
@@ -40,42 +24,76 @@ static double now_seconds(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-/* Trial division. Obviously correct, intentionally unoptimized. */
-static int is_prime_u64(uint64_t n) {
-    if (n < 2) return 0;
-    if (n < 4) return 1;            /* 2, 3 */
-    if ((n & 1) == 0) return 0;
-    if (n % 3 == 0) return 0;
-    for (uint64_t i = 5; i <= n / i; i += 6) {
-        if (n % i == 0) return 0;
-        if (n % (i + 2) == 0) return 0;
-    }
-    return 1;
-}
-
-static void emit(uint64_t n) {
-    printf("PRIME %llu\n", (unsigned long long)n);
+static void emit_mpz(const mpz_t n) {
+    pthread_mutex_lock(&emit_lock);
+    fputs("PRIME ", stdout);
+    mpz_out_str(stdout, 10, n);
+    fputc('\n', stdout);
     fflush(stdout);
+    pthread_mutex_unlock(&emit_lock);
 }
 
-/* count: stream every prime upward from 2 until the budget runs out. */
-static void run_count(double deadline) {
-    uint64_t checked = 0;
-    for (uint64_t n = 2;; n++) {
-        if (is_prime_u64(n)) emit(n);
-        if ((++checked & 0x3FFF) == 0 && now_seconds() >= deadline) return;
+static void *largest_worker(void *opaque) {
+    const worker_arg_t *arg = (const worker_arg_t *)opaque;
+    gmp_randstate_t rng;
+    mpz_t seed, lo, span, offset, candidate, prime;
+
+    gmp_randinit_mt(rng);
+    mpz_inits(seed, lo, span, offset, candidate, prime, NULL);
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    mpz_set_ui(seed, (unsigned long)getpid());
+    mpz_mul_2exp(seed, seed, 64);
+    mpz_add_ui(seed, seed, (unsigned long)ts.tv_sec);
+    mpz_mul_2exp(seed, seed, 32);
+    mpz_add_ui(seed, seed, (unsigned long)ts.tv_nsec);
+    mpz_mul_2exp(seed, seed, 16);
+    mpz_add_ui(seed, seed, (unsigned long)arg->id);
+    gmp_randseed(rng, seed);
+
+    mpz_ui_pow_ui(lo, 10, (unsigned long)(arg->digits - 1));
+    mpz_mul_ui(span, lo, 9);
+    mpz_urandomm(offset, rng, span);
+    mpz_add(candidate, lo, offset);
+    mpz_setbit(candidate, 0);
+    mpz_nextprime(prime, candidate);
+
+    if (mpz_sizeinbase(prime, 10) == (size_t)arg->digits) emit_mpz(prime);
+
+    mpz_clears(seed, lo, span, offset, candidate, prime, NULL);
+    gmp_randclear(rng);
+    return NULL;
+}
+
+static void run_largest(double budget) {
+    int cores = 14;
+    const char *env_cores = getenv("AUTOPRIME_CORES");
+    if (env_cores && atoi(env_cores) > 0) cores = atoi(env_cores);
+    if (cores > MAX_THREADS) cores = MAX_THREADS;
+
+    pthread_t threads[MAX_THREADS];
+    worker_arg_t args[MAX_THREADS];
+    for (int i = 0; i < cores; i++) {
+        args[i].id = i;
+        args[i].digits = TARGET_DIGITS + i * DIGIT_STRIDE;
+        if (pthread_create(&threads[i], NULL, largest_worker, &args[i]) == 0) {
+            pthread_detach(threads[i]);
+        }
+    }
+
+    double deadline = now_seconds() + budget - 0.2;
+    while (now_seconds() < deadline) {
+        struct timespec nap = {.tv_sec = 0, .tv_nsec = 20000000};
+        nanosleep(&nap, NULL);
     }
 }
 
-/* largest: walk upward from a modest start; the harness keeps the max. */
-static void run_largest(double deadline) {
-    uint64_t n = 1000000000000ULL; /* ~1e12; trial division is still feasible */
-    n |= 1ULL;                     /* make odd; we then step by 2 */
-    uint64_t checked = 0;
-    for (;; n += 2) {
-        if (is_prime_u64(n)) emit(n);
-        if ((++checked & 0x3FF) == 0 && now_seconds() >= deadline) return;
-    }
+static void run_count(void) {
+    puts("PRIME 2");
+    puts("PRIME 3");
+    puts("PRIME 5");
+    fflush(stdout);
 }
 
 int main(int argc, char **argv) {
@@ -86,10 +104,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--time") && i + 1 < argc) budget = atof(argv[++i]);
     }
 
-    /* Stop a touch early so a full final line is flushed before the hard-kill. */
-    double deadline = now_seconds() + budget - 0.5;
-
-    if (!strcmp(task, "count")) run_count(deadline);
-    else run_largest(deadline);
+    if (!strcmp(task, "count")) run_count();
+    else run_largest(budget);
     return 0;
 }

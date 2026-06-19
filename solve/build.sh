@@ -17,8 +17,8 @@
 #   -framework Metal -framework Foundation  # GPU compute (+ .metal/.m files)
 set -euo pipefail
 
-GMP_PREFIX="${AUTOPRIME_GMP_PREFIX:-}"
-GMP_FLAGS=()
+GMP_PREFIX="${AUTOPRIME_GMP_PREFIX:-/opt/homebrew/opt/gmp}"
+GMP_FLAGS=(-lgmp)
 if [ -n "$GMP_PREFIX" ] && [ -d "$GMP_PREFIX" ]; then
     GMP_FLAGS=(-I"$GMP_PREFIX/include" -L"$GMP_PREFIX/lib" -lgmp)
 fi
