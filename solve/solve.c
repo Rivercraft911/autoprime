@@ -8,7 +8,7 @@
 #include <gmp.h>
 
 #define MAX_THREADS 64
-#define TARGET_DIGITS 8500
+#define TARGET_DIGITS 8525
 #define DIGIT_STRIDE 0
 
 typedef struct {
