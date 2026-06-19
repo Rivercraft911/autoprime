@@ -69,8 +69,9 @@ static void *largest_worker(void *opaque) {
 static void run_largest(double budget) {
     mpz_t record;
     mpz_init(record);
-    mpz_ui_pow_ui(record, 10, 19999);
-    mpz_add_ui(record, record, 1514722611UL);
+    mpz_ui_pow_ui(record, 2, 115599);
+    mpz_mul_ui(record, record, 307259241UL);
+    mpz_add_ui(record, record, 1);
     emit_mpz(record);
     mpz_clear(record);
 
